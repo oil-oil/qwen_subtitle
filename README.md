@@ -1,6 +1,6 @@
 # qwen-subtitle
 
-用阿里云百炼(千问)系列模型,给视频做**字幕智能纠错**,并可进一步**翻译成多语言 + 用克隆原声配音**做视频出海。全程百炼 `bl` 命令行驱动。
+结合语音与真实画面纠正视频字幕，支持字幕翻译，以及用户明确授权后的声音克隆配音。
 
 ## 它解决什么
 
@@ -45,7 +45,7 @@ python3 scripts/preview_editor.py <out>/manifest.json
 
 ---
 
-`SKILL.md` 是给 AI Agent(Claude Code / Codex)读的完整说明。
+`SKILL.md` 是给 AI Agent读的完整说明。
 
 ## 翻译与声音授权
 
@@ -72,3 +72,9 @@ npx skills add oil-oil/qwen_subtitle
 ```
 
 安装后由宿主重新加载 Skill。
+
+## API Key 配置页面
+
+首次使用外部服务时，可以在本机配置页亲自填写 Key；已有配置会复用，密钥存入系统凭据库。只为实际使用的外部服务配置；纯本地处理不需要 Key。页面需要 Node.js 22.18+ 与可用的系统凭据服务，业务运行仍使用原依赖。
+
+安装、状态检查、打开页面和带凭据运行的完整入口见[配置说明](references/api-key-setup.md)。页面保存与业务读取已经接通；不把 Key 发进聊天，也不自动迁移旧文件。
