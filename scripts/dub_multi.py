@@ -9,6 +9,9 @@ qwen-subtitle 多语言出海管线: 克隆原声 → 多语言字幕 + 多语�
   注意: --clip-seconds 会限制字幕/配音的范围(不只是裁预览),省略=整片。
 """
 import json, subprocess, sys, re, os, argparse, shutil
+from pathlib import Path
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 FFMPEG = os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
 FFPROBE = os.environ.get("FFPROBE") or shutil.which("ffprobe") or "/opt/homebrew/bin/ffprobe"
@@ -46,12 +49,12 @@ def bl(args, retries=3):
     raise RuntimeError(f"bl failed: {args[:3]}")
 
 def dashscope_key():
-    # 克隆需要 curl 直调原始 API,要 key:优先环境变量,否则读 bl 自己的配置(免每次手动注入)
+    # 克隆通过 Python HTTP 客户端调用原始 API,要 key:优先环境变量,否则读 bl 自己的配置(免每次手动注入)
     k = os.environ.get("DASHSCOPE_API_KEY")
     if k:
         return k
     try:
-        return json.load(open(os.path.expanduser("~/.bailian/config.json"))).get("api_key")
+        return json.loads(Path("~/.bailian/config.json").expanduser().read_text()).get("api_key")
     except Exception:
         return None
 def content(s): return json.loads(s)["choices"][0]["message"]["content"]
@@ -60,7 +63,7 @@ def ejson(t):
     m = re.search(r"(\[.*\]|\{.*\})", t, re.S); return json.loads(m.group(1) if m else t)
 def dur(f):
     return float(subprocess.run([FFPROBE, "-v", "error", "-show_entries", "format=duration",
-                  "-of", "csv=p=0", f], capture_output=True, text=True).stdout.strip() or 0)
+                  "-of", "csv=p=0", f], capture_output=True, text=True, check=True).stdout.strip() or 0)
 
 def clone_voice(video, out_dir, sample_start):
     key = dashscope_key()
@@ -69,15 +72,23 @@ def clone_voice(video, out_dir, sample_start):
     print("[克隆] 扒人声 + 上传 + 复刻…")
     sample = os.path.join(out_dir, "voice_sample.wav")
     subprocess.run([FFMPEG, "-y", "-ss", str(sample_start), "-t", "18", "-i", video,
-                    "-ar", "16000", "-ac", "1", sample], capture_output=True)
+                    "-ar", "16000", "-ac", "1", sample], capture_output=True, check=True)
     oss = json.loads(bl(["file", "upload", "--file", sample, "--model", "cosyvoice-v2", "--output", "json"]))["url"]
     body = json.dumps({"model": "voice-enrollment", "input": {"action": "create_voice",
                        "target_model": "cosyvoice-v2", "prefix": "oil", "url": oss}})
-    r = subprocess.run(["curl", "-s", "-X", "POST", ENROLL,
-        "-H", f"Authorization: Bearer {key}",
-        "-H", "Content-Type: application/json", "-H", "X-DashScope-OssResourceResolve: enable",
-        "-d", body], capture_output=True, text=True)
-    vid = json.loads(r.stdout)["output"]["voice_id"]; print(f"[克隆] {vid}"); return vid
+    request = Request(ENROLL, data=body.encode("utf-8"), headers={
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "X-DashScope-OssResourceResolve": "enable",
+    }, method="POST")
+    try:
+        with urlopen(request, timeout=90) as response:
+            payload = json.load(response)
+    except HTTPError as exc:
+        raise RuntimeError(f"声音复刻请求失败（HTTP {exc.code}）") from None
+    except URLError:
+        raise RuntimeError("声音复刻网络请求失败，请检查网络后恢复") from None
+    vid = payload["output"]["voice_id"]; print(f"[克隆] {vid}"); return vid
 
 def merge_sentences(segs, max_dur=9.0):
     units, cur = [], None
@@ -124,7 +135,7 @@ def build_lang(code, units, voice_id, out_dir, clip_seconds):
                 "--language", tts_lang, "--text", t, "--out", raw])
             nxt = units[i + 1]["start"] if i + 1 < len(units) else clip_seconds
             slot = max(0.8, nxt - u["start"]); ratio = min(1.5, max(1.0, dur(raw) / slot))
-            subprocess.run([FFMPEG, "-y", "-i", raw, "-filter:a", f"atempo={ratio:.3f}", fit], capture_output=True)
+            subprocess.run([FFMPEG, "-y", "-i", raw, "-filter:a", f"atempo={ratio:.3f}", fit], capture_output=True, check=True)
             return (u["start"], fit, dur(fit))
         clips = pmap(synth, [(i, u, t) for i, (u, t) in enumerate(zip(units, txt))])
         track = os.path.join(out_dir, f"{code}.m4a")
@@ -133,7 +144,7 @@ def build_lang(code, units, voice_id, out_dir, clip_seconds):
             inp += ["-i", fit]; ms = int(st * 1000); filt.append(f"[{idx}]adelay={ms}|{ms}[a{idx}]"); lab.append(f"[a{idx}]")
         subprocess.run([FFMPEG, "-y"] + inp + ["-filter_complex",
             ";".join(filt) + ";" + "".join(lab) + f"amix=inputs={len(clips)}:normalize=0:dropout_transition=0[o]",
-            "-map", "[o]", "-t", str(clip_seconds), track], capture_output=True)
+            "-map", "[o]", "-t", str(clip_seconds), track], capture_output=True, check=True)
         entry["audio"] = f"{code}.m4a"
         # 字幕 = 配音文案,按配音时长计时
         tj = [{"start": u["start"],
@@ -145,7 +156,7 @@ def build_lang(code, units, voice_id, out_dir, clip_seconds):
                "end": units[i + 1]["start"] if i + 1 < len(units) else clip_seconds,
                "text": t} for i, (u, t) in enumerate(zip(units, txt))]
 
-    json.dump(tj, open(os.path.join(out_dir, f"{code}.json"), "w"), ensure_ascii=False, indent=2)
+    Path(out_dir, f"{code}.json").write_text(json.dumps(tj, ensure_ascii=False, indent=2), encoding="utf-8")
     return entry
 
 def main():
@@ -155,15 +166,30 @@ def main():
     # 0 = 整片(默认);>0 仅用于试跑前 N 秒。影响字幕/配音范围 + 预览裁剪 + 末段边界。
     ap.add_argument("--clip-seconds", type=int, default=0)
     ap.add_argument("--langs", default="en"); ap.add_argument("--voice-id", default=None)
+    ap.add_argument("--dub", action="store_true", help="明确生成配音；默认仅翻译字幕")
+    ap.add_argument("--confirm-voice-rights", action="store_true", help="已确认有权使用输入声音或 voice-id")
     args = ap.parse_args()
+    codes = list(dict.fromkeys(c.strip() for c in args.langs.split(",") if c.strip()))
+    if not codes or any(c not in LANGS for c in codes):
+        ap.error("--langs 必须包含受支持的语言代码：" + ", ".join(LANGS))
+    if args.clip_seconds < 0:
+        ap.error("--clip-seconds 不能为负数")
+    if args.voice_id and not args.dub:
+        ap.error("--voice-id 仅可与 --dub 一起使用")
+    if args.dub and any(c in DUB for c in codes) and not args.confirm_voice_rights:
+        ap.error("配音前须确认声音使用权，并传 --confirm-voice-rights")
     # 翻译/TTS 经 bl 调用,认证由 bl 自管;只有"克隆配音"那步要 key,在 clone_voice 里懒检查。
     out_dir = args.out or os.path.join(os.path.dirname(os.path.abspath(args.transcript)), "ml_out")
+    if os.path.exists(out_dir) and os.listdir(out_dir):
+        ap.error("输出目录非空，请使用新 --out 目录，避免覆盖已完成的字幕或配音")
     os.makedirs(out_dir, exist_ok=True)
 
     limit = args.clip_seconds                       # 0 = 整片
     end_bound = limit if limit else dur(args.video)  # 末段/音轨的时间边界
-    all_segs = json.load(open(args.transcript))
+    all_segs = json.loads(Path(args.transcript).read_text())
     segs = [s for s in all_segs if not limit or s["end"] <= limit]
+    if not segs:
+        ap.error("所选时间范围内没有字幕，未调用翻译或配音服务")
     units = merge_sentences(segs)
     print(f"[源] {'整片' if not limit else f'前{limit}s'}: {len(all_segs)} 碎段取 {len(segs)} → {len(units)} 整句")
 
@@ -171,20 +197,18 @@ def main():
     clipv = os.path.join(out_dir, "clip.mp4")
     if limit:
         subprocess.run([FFMPEG, "-y", "-t", str(limit), "-i", args.video,
-                        "-c:v", "libx264", "-crf", "24", "-preset", "veryfast", "-c:a", "aac", clipv], capture_output=True)
+                        "-c:v", "libx264", "-crf", "24", "-preset", "veryfast", "-c:a", "aac", clipv], capture_output=True, check=True)
     else:
-        subprocess.run([FFMPEG, "-y", "-i", args.video, "-c", "copy", clipv], capture_output=True)
-    json.dump(segs, open(os.path.join(out_dir, "zh.json"), "w"), ensure_ascii=False, indent=2)
+        subprocess.run([FFMPEG, "-y", "-i", args.video, "-c", "copy", clipv], capture_output=True, check=True)
+    Path(out_dir, "zh.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    codes = [c.strip() for c in args.langs.split(",") if c.strip() in LANGS]
-    need_clone = any(c in DUB for c in codes)
+    need_clone = args.dub and any(c in DUB for c in codes)
     voice_id = args.voice_id or (clone_voice(args.video, out_dir, max(0, segs[0]["start"])) if need_clone and segs else None)
     langs = [{"code": "zh", "name": "中文(原声)", "transcript": "zh.json", "source": True}]
     for code in codes:
         langs.append(build_lang(code, units, voice_id, out_dir, end_bound))
 
-    json.dump({"video": "clip.mp4", "languages": langs},
-              open(os.path.join(out_dir, "manifest.json"), "w"), ensure_ascii=False, indent=2)
+    Path(out_dir, "manifest.json").write_text(json.dumps({"video": "clip.mp4", "languages": langs}, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n✅ manifest: {out_dir}/manifest.json  语言: {', '.join(l['code'] for l in langs)}")
 
 if __name__ == "__main__":
