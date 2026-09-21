@@ -1,6 +1,6 @@
 ---
 name: qwen-subtitle
-description: "结合语音与真实画面纠正视频字幕，按需翻译字幕或克隆已获授权的声音配音。用户明确选择 qwen-subtitle、要求模型自动纠错或多语言配音时使用；普通中文成片字幕优先使用 oil-subtitle，不用于录屏工程剪辑。仅翻译字幕时不克隆、不配音。"
+description: "结合语音与真实画面纠正视频字幕，按需翻译字幕或克隆已获授权的声音配音。用户明确选择 qwen-subtitle、要求模型自动纠错或多语言配音时使用；普通中文成片字幕优先使用 oil-subtitle。不要用于修改 .screenstudio 工程时间线；仅翻译字幕时不克隆、不配音。"
 ---
 
 # qwen-subtitle — 百炼字幕智能纠错 + 多语言出海配音
@@ -43,9 +43,9 @@ description: "结合语音与真实画面纠正视频字幕，按需翻译字幕
 
 ## 准备
 
-使用页面配置声音复刻 API 后，`dub_multi.py` 按上述配置说明经 run 包装执行；其余 CLI 操作继续复用官方登录。
+使用页面配置声音复刻 API 后，`dub_multi.py` 必须经上述 `run` 包装入口执行；其余 CLI 操作继续复用官方登录。
 
-**认证**:`bl` 已登录就什么都不用设——脚本直接用 bl 自己的认证(`bl auth status` 验证)。克隆配音通过 Python HTTP 客户端调用原始 API,脚本会**自动从 `~/.bailian/config.json` 读 key**(或环境变量 `DASHSCOPE_API_KEY`,两者皆可)。**不需要每次手动 export**,也绝不把 key 写进任何文件。缺少凭据时使用百炼官方登录或可信运行环境注入，不让用户发 Key 到聊天。
+**认证**:`bl` 已登录就什么都不用设——脚本直接用 bl 自己的认证(`bl auth status` 验证)。克隆配音通过 Python HTTP 客户端调用原始 API，必须经配置页的 `run` 包装入口注入 `DASHSCOPE_API_KEY`；业务脚本不读取旧的明文凭据文件。缺少凭据时使用配置页或可信运行环境注入，不让用户发 Key 到聊天。
 
 依赖:
 - `bl`(百炼 CLI,v1.4+;`bl --version` 验证)
@@ -67,11 +67,11 @@ description: "结合语音与真实画面纠正视频字幕，按需翻译字幕
 python3 scripts/subfix.py <video.mp4> [--out DIR]
 ```
 
-参数:`--out DIR`(默认 `<视频名>.subfix/`)、`--max-seconds N`(试跑前 N 秒)、`--lang zh`、`--reuse`(复用 asr.json/suspects.json 只重跑后续)。
+参数:`--out DIR`(默认 `<视频名>.subfix/`)、`--max-seconds N`(试跑前 N 秒)、`--lang zh`、`--reuse`(仅在来源视频、语言和试跑范围指纹一致时复用)、`--allow-semantic-auto`(明确授权后才自动采用纯语义猜测)。已有产物时不要换视频复用目录。
 
 产出:`corrected.srt`(纠错+断句+去水词的中文字幕)、`transcript.json`(`[{start,end,text}]`)、`report.md`(每处改动 + **画面证据** + "取不到证据保留原文待确认"清单);另有 `corrected.json`(句级结构化结果)与 `report.json`(机器可读证据)。中间产物:`asr.json`/`suspects.json`。
 
-> 给用户看结果时:念 `report.md` 的改动+证据(最有说服力);诚实区分"已改(有画面铁证)"与"保留原文待确认",别把后者说成已修复。
+> 给用户看结果时:念 `report.md` 的改动+证据(最有说服力);诚实区分"已改(有画面铁证)"与"保留原文待确认",别把后者说成已修复。纯语义纠错默认也只进入待确认清单；只有用户明确允许时才传 `--allow-semantic-auto`。
 
 ## B. 多语言出海:克隆原声 + 翻译 + 配音
 
@@ -79,7 +79,7 @@ python3 scripts/subfix.py <video.mp4> [--out DIR]
 
 ```bash
 python3 scripts/dub_multi.py <video.mp4> \
-  --transcript <A的transcript.json> --langs en,ja,es,pt --out <DIR> [--clip-seconds N] [--voice-id ID]
+  --transcript <A的transcript.json> --langs en,ja,es,pt --out <DIR> [--clip-seconds N]
 ```
 
 > ⚠️ `--clip-seconds` **默认 0 = 整片**;它会**限制字幕/配音的实际范围**(不只是裁预览),只在试跑前 N 秒时才设。要整片就别带它(且上游 `subfix.py` 也别带 `--max-seconds`)。
@@ -88,6 +88,8 @@ python3 scripts/dub_multi.py <video.mp4> \
 1. **已开启配音的语言(`DUB`={en,ja,ko})**:克隆原声(扒 18s → `bl file upload` → 复刻 API → voice_id,`--voice-id` 可跳过)→ **按整句、限定词数翻译**(配音=字幕同一份文案,要在镜头时长内说完)→ **克隆音色 TTS** → `atempo` 卡时长 → 出 `<code>.json` + `<code>.m4a`(配音轨)。
 2. **仅字幕语言(其余)**:只翻译 → 出 `<code>.json`;视频保留原声。
 3. 全选了仅字幕时**不克隆**(省一步)。产出 `manifest.json` + 各语言 transcript(+配音轨) + `clip.mp4`。
+
+输出目录必须为空；已有结果请换新的 `--out`。使用页面保存的凭据时，先按[API Key 配置与业务读取](references/api-key-setup.md)的 `run` 入口执行，不能直接绕过包装器。
 
 翻译分两路(脚本 `translate()` 按 `for_dub` 自动选):**配音语言走 `qwen-plus`**——同一份稿子既配音又当字幕,按词数(`≈时长×2.6`)压到能在时长内说完;**纯字幕语言走 `qwen-mt-turbo`**(`TRANSLATE_MODEL` 常量,百炼专用翻译模型,忠实、品牌/型号天然保留)。支持:**配音=中/英/日/韩**(CosyVoice v2 官方);**字幕=92 语种**(`LANGS` 表里加 code 即可)。英文配音已充分验证;日韩配音用同一克隆音色,质量需实跑确认。
 

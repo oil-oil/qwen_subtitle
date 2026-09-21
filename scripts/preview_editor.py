@@ -6,6 +6,7 @@ Save writes transcript.json and signals exit.
 """
 
 import json
+import math
 import os
 import sys
 import threading
@@ -22,7 +23,7 @@ from flask import (
 # ----------------------------------------------------------------------------- #
 # Config
 # ----------------------------------------------------------------------------- #
-PORT = 8765
+PORT = int(os.environ.get("SUBTITLE_PREVIEW_PORT", "8765"))
 TRANSCRIPT_PATH = None
 VIDEO_PATH = None
 MANIFEST = None       # 多语言模式:解析后的 manifest dict
@@ -957,7 +958,52 @@ def _lang_transcript_path(lang):
         for L in MANIFEST.get("languages", []):
             if L["code"] == lang:
                 return os.path.join(WORKSPACE, L["transcript"])
+        raise KeyError(lang)
     return TRANSCRIPT_PATH
+
+
+def _validate_segments(segments):
+    if not isinstance(segments, list):
+        raise ValueError("segments 必须是数组")
+    previous_start = -math.inf
+    previous_end = -math.inf
+    for index, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            raise ValueError(f"第 {index + 1} 条字幕不是对象")
+        start = segment.get("start")
+        end = segment.get("end")
+        text = segment.get("text")
+        if (isinstance(start, bool) or not isinstance(start, (int, float))
+                or not math.isfinite(start) or start < 0):
+            raise ValueError(f"第 {index + 1} 条字幕的开始时间无效")
+        if (isinstance(end, bool) or not isinstance(end, (int, float))
+                or not math.isfinite(end) or end <= start):
+            raise ValueError(f"第 {index + 1} 条字幕的结束时间无效")
+        if start < previous_start:
+            raise ValueError("字幕时间必须按顺序排列")
+        if start < previous_end:
+            raise ValueError("字幕时间不能重叠")
+        if not isinstance(text, str) or not text.strip() or "\x00" in text:
+            raise ValueError(f"第 {index + 1} 条字幕正文无效")
+        previous_start = start
+        previous_end = end
+    return segments
+
+
+def _atomic_write_json(path, payload):
+    temporary = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 @app.route("/")
@@ -997,7 +1043,10 @@ def track(code):
 
 @app.route("/api/transcript", methods=["GET"])
 def get_transcript():
-    path = _lang_transcript_path(request.args.get("lang"))
+    try:
+        path = _lang_transcript_path(request.args.get("lang"))
+    except KeyError:
+        return jsonify({"error": "未知语言"}), 404
     with open(path, encoding="utf-8") as f:
         raw = f.read()
     import re as _re
@@ -1010,10 +1059,17 @@ def get_transcript():
 
 @app.route("/api/transcript", methods=["POST"])
 def post_transcript():
-    body = request.get_json()
-    path = _lang_transcript_path(body.get("lang") or request.args.get("lang"))
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"segments": body["segments"]}, f, ensure_ascii=False, indent=2)
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "请求内容无效"}), 400
+    try:
+        path = _lang_transcript_path(body.get("lang") or request.args.get("lang"))
+        segments = _validate_segments(body.get("segments"))
+    except KeyError:
+        return jsonify({"error": "未知语言"}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    _atomic_write_json(path, {"segments": segments})
     RESULT_DONE.set()
     return jsonify({"ok": True})
 
@@ -1024,13 +1080,18 @@ def post_transcript():
 def main():
     global VIDEO_PATH, TRANSCRIPT_PATH, MANIFEST, WORKSPACE
 
-    if len(sys.argv) < 2:
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("paths", nargs="+")
+    parser.add_argument("--port", type=int, default=PORT)
+    args = parser.parse_args()
+    if len(args.paths) < 1:
         print("Usage: preview_editor.py <video.mp4> <transcript.json>")
         print("   or: preview_editor.py <manifest.json>   # 多语言模式")
         sys.exit(1)
 
-    a1 = os.path.abspath(sys.argv[1])
-    if a1.endswith("manifest.json") and len(sys.argv) == 2:
+    a1 = os.path.abspath(args.paths[0])
+    if a1.endswith("manifest.json") and len(args.paths) == 1:
         # 多语言:manifest 模式
         WORKSPACE = os.path.dirname(a1)
         MANIFEST = json.load(open(a1, encoding="utf-8"))
@@ -1038,23 +1099,25 @@ def main():
         src = next((L for L in MANIFEST["languages"] if L.get("source")), MANIFEST["languages"][0])
         TRANSCRIPT_PATH = os.path.join(WORKSPACE, src["transcript"])
     else:
-        if len(sys.argv) < 3:
+        if len(args.paths) < 2:
             print("Usage: preview_editor.py <video.mp4> <transcript.json>")
             sys.exit(1)
         VIDEO_PATH = a1
-        TRANSCRIPT_PATH = os.path.abspath(sys.argv[2])
+        TRANSCRIPT_PATH = os.path.abspath(args.paths[1])
 
     if not Path(VIDEO_PATH).exists():
         print(f"❌ File not found: {VIDEO_PATH}")
         sys.exit(1)
 
     import shutil
-    shutil.copy2(TRANSCRIPT_PATH, TRANSCRIPT_PATH + ".orig.json")
+    original_path = TRANSCRIPT_PATH + ".orig.json"
+    if not os.path.exists(original_path):
+        shutil.copy2(TRANSCRIPT_PATH, original_path)
     print(f"[preview] Video:     {VIDEO_PATH}")
     print(f"[preview] {'Manifest: ' + a1 if MANIFEST else 'Transcript: ' + TRANSCRIPT_PATH}")
-    print(f"[preview] Flask running on http://localhost:{PORT}")
+    print(f"[preview] Flask running on http://127.0.0.1:{args.port}")
 
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
+    app.run(host="127.0.0.1", port=args.port, debug=False, use_reloader=False, threaded=True)
     print("[preview] Exiting.")
 
 

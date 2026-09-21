@@ -37,6 +37,8 @@ python3 scripts/dub_multi.py <video.mp4> --transcript <上一步>/transcript.jso
 python3 scripts/preview_editor.py <out>/manifest.json
 ```
 
+默认只自动采用有画面文字证据的纠错；纯语义猜测会留在报告中等待确认。已有输出目录不要换视频复用；需要恢复时使用同一来源视频和 `--reuse`。
+
 ## 设计原则:零误改优先
 
 错误的"纠正"比不纠正更糟。每一步都"宁可漏改,不可改错":只标明显听错的;VL 只认画面上能逐字读到的文字(禁图标幻觉);最小替换、发音一致;取不到画面证据就保留原文 + 标记待确认。细节见 [`references/design-gates.md`](references/design-gates.md)。
@@ -78,3 +80,13 @@ npx skills add oil-oil/qwen_subtitle
 首次使用外部服务时，可以在本机配置页亲自填写 Key；已有配置会复用，密钥存入系统凭据库。只为实际使用的外部服务配置；纯本地处理不需要 Key。页面需要 Node.js 22.18+ 与可用的系统凭据服务，业务运行仍使用原依赖。
 
 安装、状态检查、打开页面和带凭据运行的完整入口见[配置说明](references/api-key-setup.md)。页面保存与业务读取已经接通；不把 Key 发进聊天，也不自动迁移旧文件。
+
+## 测试
+
+```bash
+python3 -m py_compile scripts/*.py
+python3 -m unittest discover -s tests
+npm --prefix scripts/credential-ui run check
+npm --prefix scripts/credential-ui run build
+npm --prefix scripts/credential-ui test
+```

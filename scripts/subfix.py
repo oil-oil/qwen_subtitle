@@ -12,7 +12,8 @@ subfix —— 百炼三段式字幕纠错(纯工作流,一步到位)
 
 依赖: bl (百炼 CLI,自带认证)、ffmpeg
 """
-import argparse, json, subprocess, sys, re, os, shutil
+import argparse, hashlib, json, subprocess, sys, re, os, shutil
+from pathlib import Path
 
 FFMPEG = os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
 
@@ -26,6 +27,11 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 WORKERS = int(os.environ.get("SUBFIX_WORKERS", "8"))   # 全局并发上限
 _SEM = threading.Semaphore(WORKERS)                     # 限同时在飞的 bl 调用
+MODEL_BATCH_CHARS = 12000
+KNOWN_ARTIFACTS = {
+    "run-meta.json", "asr.json", "suspects.json", "corrected.srt",
+    "transcript.json", "corrected.json", "report.json", "report.md",
+}
 
 def pmap(fn, items):
     items = list(items)
@@ -63,6 +69,79 @@ def ms_to_srt(ms):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def write_json(path, payload):
+    """原子写入 JSON 产物，避免中断时留下半个文件。"""
+    write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def write_text(path, content):
+    """原子写入文本产物，避免中断时留下半个文件。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def source_signature(video, max_seconds, lang):
+    """生成来源视频、语言和试跑范围的可复用指纹。"""
+    path = Path(video).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"视频不存在: {path}")
+    stat = path.stat()
+    digest = hashlib.sha256()
+    edge_size = 1024 * 1024
+    with path.open("rb") as stream:
+        digest.update(stream.read(edge_size))
+        if stat.st_size > edge_size:
+            stream.seek(max(0, stat.st_size - edge_size))
+            digest.update(stream.read(edge_size))
+    return {
+        "video": str(path),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "edge_sha256": digest.hexdigest(),
+        "max_seconds": int(max_seconds or 0),
+        "language": lang,
+    }
+
+
+def prepare_run_meta(out_dir, signature, reuse):
+    out_dir = Path(out_dir)
+    meta_path = out_dir / "run-meta.json"
+    if reuse:
+        if not meta_path.exists():
+            raise RuntimeError("--reuse 缺少 run-meta.json，无法确认中间产物属于当前视频")
+        try:
+            existing = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"无法读取 run-meta.json: {exc}") from exc
+        if existing != signature:
+            raise RuntimeError("--reuse 的视频、语言或试跑范围与原任务不一致，请使用新的 --out")
+        return
+    if out_dir.exists() and any((out_dir / name).exists() for name in KNOWN_ARTIFACTS):
+        raise RuntimeError("输出目录已有字幕产物；请使用 --reuse 恢复，或指定新的 --out")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_json(meta_path, signature)
+
+
+def batches(items, render, max_chars=MODEL_BATCH_CHARS):
+    """按提示词字符数切分模型输入，同时保留原始条目。"""
+    current, size = [], 0
+    for item in items:
+        rendered = render(item)
+        if current and size + len(rendered) > max_chars:
+            yield current
+            current, size = [], 0
+        current.append(item)
+        size += len(rendered)
+    if current:
+        yield current
+
+
 # ---------------- 1. ASR ----------------
 def run_asr(video, out_dir, max_seconds, lang):
     wav = os.path.join(out_dir, "audio.wav")
@@ -70,11 +149,14 @@ def run_asr(video, out_dir, max_seconds, lang):
     if max_seconds:
         cmd += ["-t", str(max_seconds)]
     cmd += ["-ar", "16000", "-ac", "1", wav]
-    subprocess.run(cmd, capture_output=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not Path(wav).is_file():
+        detail = (result.stderr or "").strip()[-500:]
+        raise RuntimeError(f"ffmpeg 提取音频失败{(': ' + detail) if detail else ''}")
     asr_json = os.path.join(out_dir, "asr.json")
     bl(["speech", "recognize", "--url", wav, "--language", lang,
         "--out", asr_json, "--quiet"])
-    data = json.load(open(asr_json))
+    data = json.loads(Path(asr_json).read_text(encoding="utf-8"))
     return data["transcripts"][0]["sentences"]
 
 
@@ -110,12 +192,49 @@ FLAG_USER = """下面是按句编号的字幕。请标记所有"明显被听错"
 {lines}"""
 
 
+def validate_suspects(items, sents):
+    if not isinstance(items, list):
+        raise RuntimeError("标错模型没有返回 JSON 数组")
+    valid, seen = [], set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        sid = item.get("sid")
+        wrong = item.get("wrong")
+        kind = item.get("kind")
+        if type(sid) is not int or not 0 <= sid < len(sents):
+            continue
+        if not isinstance(wrong, str) or not wrong.strip() or wrong not in sents[sid].get("text", ""):
+            continue
+        if kind not in {"screen", "semantic"}:
+            continue
+        key = (sid, wrong)
+        if key in seen:
+            continue
+        seen.add(key)
+        valid.append({
+            "sid": sid,
+            "wrong": wrong,
+            "reason": str(item.get("reason") or ""),
+            "kind": kind,
+            "guess": str(item.get("guess") or ""),
+        })
+    return valid
+
+
 def flag_suspects(sents):
-    lines = "\n".join(f"{i}: {s['text']}" for i, s in enumerate(sents))
-    out = bl(["text", "chat", "--model", FLAG_MODEL, "--system", FLAG_SYS,
-              "--message", FLAG_USER.format(lines=lines),
-              "--max-tokens", "3000", "--output", "json"])
-    return extract_json(content(out))
+    suspects = []
+    indexed = list(enumerate(sents))
+    for chunk in batches(indexed, lambda item: f"{item[1]['text']}\n"):
+        lines = "\n".join(f"{index}: {sent['text']}" for index, sent in chunk)
+        out = bl(["text", "chat", "--model", FLAG_MODEL, "--system", FLAG_SYS,
+                  "--message", FLAG_USER.format(lines=lines),
+                  "--max-tokens", "3000", "--output", "json"])
+        result = extract_json(content(out))
+        if not isinstance(result, list):
+            raise RuntimeError("标错模型返回的不是 JSON 数组")
+        suspects.extend(result)
+    return validate_suspects(suspects, sents)
 
 
 # ---------------- 3. VL 看帧纠正 ----------------
@@ -137,7 +256,7 @@ VL_PROMPT = """这是一段录屏视频的一帧画面。该处字幕(语音识�
 
 def word_time_ms(sent, wrong):
     for w in sent.get("words", []):
-        if w["text"] and (w["text"] in wrong or wrong in w["text"]):
+        if w.get("text") and (w["text"] in wrong or wrong in w["text"]):
             return (w["begin_time"] + w["end_time"]) // 2
     return (sent["begin_time"] + sent["end_time"]) // 2
 
@@ -148,12 +267,15 @@ def grab_frame(video, ms, path):
     return path
 
 
-def correct(video, sents, suspects, frames_dir):
+def correct(video, sents, suspects, frames_dir, allow_semantic_auto=False):
     # 各 suspect 相互独立 → 并发看帧纠正(每个内部 3 帧仍按命中即停顺序试)
     def one(idx_s):
         idx, s = idx_s
         sent = sents[s["sid"]]
         if s["kind"] != "screen":
+            if not allow_semantic_auto:
+                return {**s, "final": s["wrong"], "via": "semantic-pending",
+                        "needs_review": True, "guess_only": s.get("guess", "")}
             return {**s, "final": s.get("guess", s["wrong"]), "via": "semantic"}
         decided = None
         for j, ms in enumerate([word_time_ms(sent, s["wrong"]),
@@ -165,9 +287,13 @@ def correct(video, sents, suspects, frames_dir):
                     "--output", "json", "--quiet"])))
             except Exception as e:
                 sys.stderr.write(f"  VL parse fail s{idx}: {e}\n"); continue
-            if vj.get("found"):
+            correct_text = vj.get("correct") if isinstance(vj, dict) else None
+            evidence = vj.get("evidence") if isinstance(vj, dict) else None
+            if (vj.get("found") is True and isinstance(correct_text, str)
+                    and correct_text.strip() and "\n" not in correct_text
+                    and isinstance(evidence, str) and evidence.strip()):
                 decided = {**s, "final": vj["correct"], "via": f"vl@{ms/1000:.1f}s",
-                           "evidence": vj.get("evidence", ""),
+                           "evidence": evidence,
                            "frame": os.path.basename(img)}
                 break
         if not decided:
@@ -231,6 +357,28 @@ FILLER_USER = """下面是按行编号的字幕。请去掉每行里的"水词",
 
 import re as _re2
 _FILLERS = ["呃", "啊", "嗯", "诶", "唉", "噢", "哦"]
+
+
+def safe_filler_edit(before, after):
+    """只接受删除水词、空白或相邻重复字的结果。"""
+    from difflib import SequenceMatcher
+
+    for tag, i1, i2, _j1, _j2 in SequenceMatcher(None, before, after).get_opcodes():
+        if tag == "equal":
+            continue
+        if tag != "delete":
+            return False
+        for index in range(i1, i2):
+            char = before[index]
+            if char in _FILLERS or char.isspace():
+                continue
+            previous = before[index - 1] if index else ""
+            following = before[index + 1] if index + 1 < len(before) else ""
+            if char != previous and char != following:
+                return False
+    return True
+
+
 def _rule_clean(t):
     for f in _FILLERS:
         t = t.replace("，" + f + "，", "，").replace(f + "，", "").replace("，" + f, "")
@@ -239,20 +387,27 @@ def _rule_clean(t):
     return _re2.sub(r"\s{2,}", " ", t).strip("， ").strip()
 
 def clean_fillers(segs):
-    lines = "\n".join(f"{i}: {s['text']}" for i, s in enumerate(segs))
-    cleaned = None
-    try:
-        out = bl(["text", "chat", "--model", FILLER_MODEL, "--system", FILLER_SYS,
-                  "--message", FILLER_USER.format(lines=lines),
-                  "--max-tokens", "5000", "--output", "json"])
-        data = extract_json(content(out))
-        if isinstance(data, list) and len(data) == len(segs):
-            cleaned = [c if isinstance(c, str) else (c.get("text") if isinstance(c, dict) else None) for c in data]
-    except Exception as e:
-        sys.stderr.write(f"  去水词(qwen)失败,回退规则法: {e}\n")
+    cleaned = {}
+    indexed = list(enumerate(segs))
+    for chunk in batches(indexed, lambda item: f"{item[1]['text']}\n"):
+        lines = "\n".join(f"{index}: {segment['text']}" for index, segment in chunk)
+        try:
+            out = bl(["text", "chat", "--model", FILLER_MODEL, "--system", FILLER_SYS,
+                      "--message", FILLER_USER.format(lines=lines),
+                      "--max-tokens", "5000", "--output", "json"])
+            data = extract_json(content(out))
+            if isinstance(data, list) and len(data) == len(chunk):
+                for (index, segment), candidate in zip(chunk, data):
+                    candidate = candidate if isinstance(candidate, str) else (
+                        candidate.get("text") if isinstance(candidate, dict) else None
+                    )
+                    if candidate is not None and safe_filler_edit(segment["text"], candidate):
+                        cleaned[index] = candidate
+        except Exception as e:
+            sys.stderr.write(f"  去水词(qwen)失败,回退规则法: {e}\n")
     res = []
     for i, s in enumerate(segs):
-        t = (cleaned[i] if cleaned and cleaned[i] else _rule_clean(s["text"])).strip()
+        t = (cleaned[i] if i in cleaned else _rule_clean(s["text"])).strip()
         if t:
             s = dict(s); s["text"] = t; res.append(s)
     return res
@@ -285,19 +440,15 @@ def build_outputs(sents, results, out_dir):
     srt = []
     for i, s in enumerate(segments, 1):
         srt.append(f"{i}\n{ms_to_srt(s['begin_time'])} --> {ms_to_srt(s['end_time'])}\n{s['text']}\n")
-    open(os.path.join(out_dir, "corrected.srt"), "w").write("\n".join(srt))
+    write_text(Path(out_dir, "corrected.srt"), "\n".join(srt))
 
     # 预览页格式(start/end 秒 + text)
     preview = [{"start": round(s["begin_time"] / 1000, 3),
                 "end": round(s["end_time"] / 1000, 3),
                 "text": s["text"]} for s in segments]
-    json.dump(preview, open(os.path.join(out_dir, "transcript.json"), "w"),
-              ensure_ascii=False, indent=2)
-
-    json.dump(corrected, open(os.path.join(out_dir, "corrected.json"), "w"),
-              ensure_ascii=False, indent=2)
-    json.dump(results, open(os.path.join(out_dir, "report.json"), "w"),
-              ensure_ascii=False, indent=2)
+    write_json(Path(out_dir, "transcript.json"), preview)
+    write_json(Path(out_dir, "corrected.json"), corrected)
+    write_json(Path(out_dir, "report.json"), results)
 
     review = [r for r in results if r.get("needs_review")]
 
@@ -314,7 +465,7 @@ def build_outputs(sents, results, out_dir):
         for r in review:
             g = f",模型猜测可能是「{r['guess_only']}」" if r.get("guess_only") else ""
             rep.append(f"- 句{r['sid']} 「{r['wrong']}」 可疑{g}(原因: {r.get('reason','')})")
-    open(os.path.join(out_dir, "report.md"), "w").write("\n".join(rep))
+    write_text(Path(out_dir, "report.md"), "\n".join(rep))
     return segments, changes, review
 
 
@@ -324,22 +475,30 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--max-seconds", type=int, default=0)
     ap.add_argument("--lang", default="zh")
+    ap.add_argument("--allow-semantic-auto", action="store_true",
+                    help="允许自动采用纯语义纠错猜测；默认保留待人工确认")
     ap.add_argument("--reuse", action="store_true",
                     help="复用 out 目录已有的 asr.json / suspects.json,只重跑 VL")
     args = ap.parse_args()
 
-    # 认证由 bl CLI 自管(~/.bailian/config.json 或 DASHSCOPE_API_KEY),脚本不强制环境变量,
-    # 避免每次还要手动注入密钥。bl 未认证时,下面第一个 bl 调用会自然报错。
+    # 认证由 bl CLI 自管；缺少官方登录时，下面第一个 bl 调用会自然报错。
 
-    out_dir = args.out or (os.path.splitext(args.video)[0] + ".subfix")
-    frames_dir = os.path.join(out_dir, "frames")
-    os.makedirs(frames_dir, exist_ok=True)
-    asr_path = os.path.join(out_dir, "asr.json")
-    sus_path = os.path.join(out_dir, "suspects.json")
+    if args.max_seconds < 0:
+        ap.error("--max-seconds 不能为负数")
+    try:
+        signature = source_signature(args.video, args.max_seconds, args.lang)
+        out_dir = Path(args.out or (os.path.splitext(args.video)[0] + ".subfix")).expanduser()
+        prepare_run_meta(out_dir, signature, args.reuse)
+    except (FileNotFoundError, RuntimeError) as exc:
+        ap.error(str(exc))
+    frames_dir = out_dir / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    asr_path = out_dir / "asr.json"
+    sus_path = out_dir / "suspects.json"
 
     if args.reuse and os.path.exists(asr_path):
         print(f"[1/4] 复用 asr.json")
-        sents = json.load(open(asr_path))["transcripts"][0]["sentences"]
+        sents = json.loads(asr_path.read_text(encoding="utf-8"))["transcripts"][0]["sentences"]
     else:
         print(f"[1/4] FunAudio ASR …")
         sents = run_asr(args.video, out_dir, args.max_seconds, args.lang)
@@ -347,17 +506,19 @@ def main():
 
     if args.reuse and os.path.exists(sus_path):
         print(f"[2/4] 复用 suspects.json")
-        suspects = json.load(open(sus_path))
+        suspects = validate_suspects(
+            json.loads(sus_path.read_text(encoding="utf-8")), sents
+        )
     else:
         print(f"[2/4] qwen3.7-max 标错(高精度)…")
         suspects = flag_suspects(sents)
-        json.dump(suspects, open(sus_path, "w"), ensure_ascii=False, indent=2)
+        write_json(sus_path, suspects)
     print(f"      标出 {len(suspects)} 处可疑")
     for s in suspects:
         print(f"        [{s['kind']:8s}] 句{s['sid']}: 「{s['wrong']}」→ 猜「{s.get('guess','')}」")
 
     print(f"[3/4] qwen-vl 看帧纠正 …")
-    results = correct(args.video, sents, suspects, frames_dir)
+    results = correct(args.video, sents, suspects, frames_dir, args.allow_semantic_auto)
 
     print(f"[4/4] 断句顺滑(拆长句+去水词) + 产出 SRT/报告 …")
     segments, changes, review = build_outputs(sents, results, out_dir)

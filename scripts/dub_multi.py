@@ -49,14 +49,8 @@ def bl(args, retries=3):
     raise RuntimeError(f"bl failed: {args[:3]}")
 
 def dashscope_key():
-    # 克隆通过 Python HTTP 客户端调用原始 API,要 key:优先环境变量,否则读 bl 自己的配置(免每次手动注入)
-    k = os.environ.get("DASHSCOPE_API_KEY")
-    if k:
-        return k
-    try:
-        return json.loads(Path("~/.bailian/config.json").expanduser().read_text()).get("api_key")
-    except Exception:
-        return None
+    # 声音复刻只从可信运行环境读取；页面凭据通过 credential-ui run 注入。
+    return os.environ.get("DASHSCOPE_API_KEY", "").strip() or None
 def content(s): return json.loads(s)["choices"][0]["message"]["content"]
 def ejson(t):
     t = re.sub(r"^```[a-z]*\n?", "", t.strip()); t = re.sub(r"\n?```$", "", t).strip()
@@ -68,7 +62,7 @@ def dur(f):
 def clone_voice(video, out_dir, sample_start):
     key = dashscope_key()
     if not key:
-        sys.exit("ERROR: 克隆配音需要百炼密钥(环境变量 DASHSCOPE_API_KEY 或 ~/.bailian/config.json)")
+        sys.exit("ERROR: 克隆配音需要通过 API Key 配置页或可信运行环境提供 DASHSCOPE_API_KEY")
     print("[克隆] 扒人声 + 上传 + 复刻…")
     sample = os.path.join(out_dir, "voice_sample.wav")
     subprocess.run([FFMPEG, "-y", "-ss", str(sample_start), "-t", "18", "-i", video,
