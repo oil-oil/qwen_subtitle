@@ -1,52 +1,51 @@
 #!/usr/bin/env python3
 """
-subfix —— 百炼三段式字幕纠错(纯工作流,一步到位)
+subfix —— 百炼一步视觉字幕纠错。
 
-  视频 ──► FunAudio ASR(词级时间戳)
-        ──► qwen3.7-max 高精度标错(只标明显听错)
-        ──► qwen-vl 按时间戳抽帧、读屏纠正
-        ──► 修正后 SRT + transcript.json + 证据报告
+  视频 ──► FunAudio ASR(句级+词级时间戳)
+        ──► qwen3.8-max 读取整段视频并返回最小术语替换
+        ──► 词级时间戳断句 + 去水词
+        ──► corrected.srt + transcript.json + 证据报告
 
-用法(bl 已登录即可,**无需设任何密钥/环境变量**):
+用法(bl 已登录即可,无需额外设置密钥):
   python3 subfix.py <video.mp4> [--out DIR] [--max-seconds N] [--lang zh]
 
 依赖: bl (百炼 CLI,自带认证)、ffmpeg
 """
-import argparse, hashlib, json, subprocess, sys, re, os, shutil
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
 from pathlib import Path
 
+
 FFMPEG = os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
-
-# 模型分工(实测:max 标错最准但慢108s;plus 快5×但精度崩。故精度命门用max,低风险用plus)
-FLAG_MODEL = "qwen3.7-max"   # 标错:精度命门
-VL_MODEL = "qwen3-vl-plus"   # 看帧纠正
-FILLER_MODEL = "qwen-plus"   # 去水词:低风险,plus 够用且快
-
-
-from concurrent.futures import ThreadPoolExecutor
-import threading
-WORKERS = int(os.environ.get("SUBFIX_WORKERS", "8"))   # 全局并发上限
-_SEM = threading.Semaphore(WORKERS)                     # 限同时在飞的 bl 调用
+CORRECTION_MODEL = os.environ.get("SUBFIX_CORRECTION_MODEL", "qwen3.8-max")
+FILLER_MODEL = "qwen-plus"
 MODEL_BATCH_CHARS = 12000
+WORKERS = int(os.environ.get("SUBFIX_WORKERS", "8"))
+_SEM = threading.Semaphore(WORKERS)
 KNOWN_ARTIFACTS = {
-    "run-meta.json", "asr.json", "suspects.json", "corrected.srt",
-    "transcript.json", "corrected.json", "report.json", "report.md",
+    "run-meta.json", "asr.json", "correction.json",
+    "corrected.srt", "transcript.json", "corrected.json", "report.json",
+    "report.md",
 }
 
-def pmap(fn, items):
-    items = list(items)
-    if len(items) <= 1:
-        return [fn(x) for x in items]
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        return list(ex.map(fn, items))                 # 保序
 
 def bl(args, retries=3):
-    for a in range(retries):
+    for attempt in range(retries):
         with _SEM:
-            p = subprocess.run(["bl"] + args, capture_output=True, text=True)
-        if p.returncode == 0:
-            return p.stdout
-        sys.stderr.write(f"[retry {a+1}] bl {args[:2]}: {p.stderr[:160]}\n")
+            process = subprocess.run(["bl"] + args, capture_output=True, text=True)
+        if process.returncode == 0:
+            return process.stdout
+        sys.stderr.write(
+            f"[retry {attempt + 1}] bl {args[:2]}: {process.stderr[:160]}\n"
+        )
         subprocess.run(["sleep", "3"])
     raise RuntimeError(f"bl failed: {args[:3]}")
 
@@ -58,32 +57,38 @@ def content(stdout):
 def extract_json(text):
     text = re.sub(r"^```[a-z]*\n?", "", text.strip())
     text = re.sub(r"\n?```$", "", text).strip()
-    m = re.search(r"(\[.*\]|\{.*\})", text, re.S)
-    return json.loads(m.group(1)) if m else json.loads(text)
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            value, _end = decoder.raw_decode(text[index:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    raise json.JSONDecodeError("未找到合法 JSON", text, 0)
 
 
 def ms_to_srt(ms):
-    h, ms = divmod(int(ms), 3600000)
-    m, ms = divmod(ms, 60000)
-    s, ms = divmod(ms, 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+    hours, ms = divmod(int(ms), 3600000)
+    minutes, ms = divmod(ms, 60000)
+    seconds, ms = divmod(ms, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{ms:03d}"
 
 
-def write_json(path, payload):
-    """原子写入 JSON 产物，避免中断时留下半个文件。"""
-    write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-
-
-def write_text(path, content):
-    """原子写入文本产物，避免中断时留下半个文件。"""
+def write_text(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        temporary.write_text(content, encoding="utf-8")
+        temporary.write_text(value, encoding="utf-8")
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def write_json(path, payload):
+    write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 def source_signature(video, max_seconds, lang):
@@ -129,7 +134,7 @@ def prepare_run_meta(out_dir, signature, reuse):
 
 
 def batches(items, render, max_chars=MODEL_BATCH_CHARS):
-    """按提示词字符数切分模型输入，同时保留原始条目。"""
+    """按提示词字符数切分低风险文本任务，同时保留原始条目。"""
     current, size = [], 0
     for item in items:
         rendered = render(item)
@@ -145,13 +150,13 @@ def batches(items, render, max_chars=MODEL_BATCH_CHARS):
 # ---------------- 1. ASR ----------------
 def run_asr(video, out_dir, max_seconds, lang):
     wav = os.path.join(out_dir, "audio.wav")
-    cmd = [FFMPEG, "-y", "-i", video]
+    command = [FFMPEG, "-y", "-i", video]
     if max_seconds:
-        cmd += ["-t", str(max_seconds)]
-    cmd += ["-ar", "16000", "-ac", "1", wav]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0 or not Path(wav).is_file():
-        detail = (result.stderr or "").strip()[-500:]
+        command += ["-t", str(max_seconds)]
+    command += ["-ar", "16000", "-ac", "1", wav]
+    process = subprocess.run(command, capture_output=True, text=True)
+    if process.returncode != 0 or not Path(wav).is_file():
+        detail = (process.stderr or "").strip()[-500:]
         raise RuntimeError(f"ffmpeg 提取音频失败{(': ' + detail) if detail else ''}")
     asr_json = os.path.join(out_dir, "asr.json")
     bl(["speech", "recognize", "--url", wav, "--language", lang,
@@ -160,202 +165,184 @@ def run_asr(video, out_dir, max_seconds, lang):
     return data["transcripts"][0]["sentences"]
 
 
-# ---------------- 2. 高精度标错 ----------------
-FLAG_SYS = "你是中文技术视频字幕的资深校对。字幕由语音识别(ASR)生成。你只做一件事:找出明显被听错的地方。不润色、不补全、不规整。"
+# ---------------- 2. 一步视觉纠错 ----------------
+CORRECTION_USER = """你是技术视频字幕的事实校对器。请一次读取整段视频，并结合下面带时间范围的 ASR 句子找出真正的听错词。
 
-FLAG_USER = """下面是按句编号的字幕。请标记所有"明显被听错"的位置。
+只输出严格 JSON 对象，不要 Markdown、解释或思维过程：
+{{"items":[{{"sid":0,"changes":[{{"wrong":"原文片段","correct":"最小替换","kind":"screen","change_type":"term","reason":"一句话理由","evidence":"画面中逐字可见的文字"}}]}}]}}
 
-【该标记 —— 真实术语/名称被念岔、听错】
-- 专有名词/产品名被听成发音相近的错形:cloud→Claude、class q→Claude、play right→Playwright。
-- 文件名/命令被口语化或听错:把 "SKILL.md" 念成 "skill 点 md"(“点”就是口述的小数点)、"html2pptx" 听成 "html to ppt"、"OOCML" 实为 "OOXML"。
-- 中文同音字错误、词义不通:原数据→元数据、飞树→飞书。
+要求：
+1. 每个 ASR 句子都要有一个 item；没有确认错误时 changes 为 []。只用对应句子的时间范围取证，不要用其他时间段的文字替代它。
+2. 只输出真正的 ASR 错词、专有名词大小写/写法错误、命令、代码、文件名或界面文字错误。不要润色，不要改语气，不要补全，不要改写句子。
+3. change_type 只能是 term 或 orthography。标点、空格、断句、语法、口语选择和“更顺口”的修改禁止输出。
+4. screen：correct 必须能在对应时间范围的画面中逐字读到，evidence 必须引用画面原文；logo、图标、常识或猜测不能算证据。semantic：纯语义同音错，没有画面证据，默认只待人工确认。
+5. wrong 必须是对应 ASR 句子的连续原文片段；correct 只能替换 wrong，不要带入相邻文字。原文是对的就不要输出。
+6. 按 ASR 句子从前到后逐句检查，先检查画面里的产品名、插件名、命令、文件名、模型名，再决定 changes；不要因为只差大小写、连字符或英文单词之间的空格就跳过明确的 screen 术语。每个明确的 screen 写法差异都要返回一个最小替换。例如 ASR 的“oil codex title”与画面中的“oil-codex-title”必须返回为一个 orthography 替换。
+7. 不要把“登录、表单、布局优化”改成“登录表单、布局优化”，不要把“一会”改成“一会儿”；这类属于表达或标点调整，不是 ASR 错词。
 
-【绝不标记 —— 否则就是过度纠正】
-- 本身正确、只是"可能更具体"的词:说话人说 "ooxml" 就是 ooxml,不要因为屏幕上有 "ooxml.md" 就标它。不补后缀、不补全、不扩写。判断标准:说话人嘴上发出的音对应的词本身有没有错;有错才标,只是"不够具体"不标。
-- 读起来通顺、像一个名字/词的中文(哪怕你怀疑它是某英文产品的音译)。例:"超级麦吉" 读着就是个产品名,不要因为你猜它可能是 SuperAGI/Supermaven 就标它。只有当中文本身明显不通、是同音错字时才标(如 飞树→飞书、原数据→元数据)。
-- 语气词、口语重复、不影响理解的口误。
-
-【kind 分类规则】
-- 只要正确写法是英文/产品名/文件名/命令/代码/界面文字这类"屏幕上能查到"的,一律填 "screen"(交给画面取证,即使你已经很确定)。
-- 仅当是纯中文同音错、画面上不会出现对应文字时,才填 "semantic"。
-
-对每个可疑点输出对象:
-- sid: 句子编号(整数)
-- wrong: 听错的原文片段(尽量短)
-- reason: 一句话理由
-- kind: "screen" 或 "semantic"(按上面规则)
-- guess: 修正猜测(screen 类最终以画面为准)
-
-只输出 JSON 数组,无多余文字。若没有任何可疑点,输出 []。
-
-字幕:
+ASR 句子：
 {lines}"""
 
 
-def validate_suspects(items, sents):
-    if not isinstance(items, list):
-        raise RuntimeError("标错模型没有返回 JSON 数组")
-    valid, seen = [], set()
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        sid = item.get("sid")
-        wrong = item.get("wrong")
-        kind = item.get("kind")
-        if type(sid) is not int or not 0 <= sid < len(sents):
-            continue
-        if not isinstance(wrong, str) or not wrong.strip() or wrong not in sents[sid].get("text", ""):
-            continue
-        if kind not in {"screen", "semantic"}:
-            continue
-        key = (sid, wrong)
-        if key in seen:
-            continue
-        seen.add(key)
-        valid.append({
-            "sid": sid,
+def _is_format_only(old, new):
+    format_chars = set(" \t\r\n，。！？、；：…,.!?;:()（）[]【】{}<>《》‘’“”\"'—-·|｜/")
+    changed = (old or "") + (new or "")
+    return bool(changed) and all(char in format_chars for char in changed)
+
+
+def _without_format(text):
+    format_chars = set(" \t\r\n，。！？、；：…,.!?;:()（）[]【】{}<>《》‘’“”\"'—-·|｜/")
+    return "".join(char for char in text if char not in format_chars)
+
+
+def _valid_change(change, sentence, allow_semantic_auto=False):
+    if not isinstance(change, dict):
+        return None
+    wrong = change.get("wrong")
+    correct_text = change.get("correct")
+    kind = change.get("kind")
+    change_type = change.get("change_type")
+    evidence = str(change.get("evidence") or "").strip()
+    if not isinstance(wrong, str) or not wrong.strip() or wrong not in sentence:
+        return None
+    if not isinstance(correct_text, str) or not correct_text.strip() or "\n" in correct_text:
+        return None
+    if (
+        correct_text == wrong
+        or _is_format_only(wrong, correct_text)
+        or _without_format(wrong) == _without_format(correct_text)
+    ):
+        return None
+    if kind not in {"screen", "semantic"} or change_type not in {"term", "orthography"}:
+        return None
+    if kind == "screen" and not evidence:
+        return None
+    if kind == "semantic" and not allow_semantic_auto:
+        return {
             "wrong": wrong,
-            "reason": str(item.get("reason") or ""),
+            "final": wrong,
             "kind": kind,
-            "guess": str(item.get("guess") or ""),
-        })
-    return valid
+            "reason": str(change.get("reason") or ""),
+            "via": "semantic-pending",
+            "needs_review": True,
+            "guess_only": correct_text,
+        }
+    return {
+        "wrong": wrong,
+        "final": correct_text,
+        "kind": kind,
+        "reason": str(change.get("reason") or ""),
+        "via": f"{CORRECTION_MODEL}-video",
+        "evidence": evidence,
+    }
 
 
-def flag_suspects(sents):
-    suspects = []
-    indexed = list(enumerate(sents))
-    for chunk in batches(indexed, lambda item: f"{item[1]['text']}\n"):
-        lines = "\n".join(f"{index}: {sent['text']}" for index, sent in chunk)
-        out = bl(["text", "chat", "--model", FLAG_MODEL, "--system", FLAG_SYS,
-                  "--message", FLAG_USER.format(lines=lines),
-                  "--max-tokens", "3000", "--output", "json"])
-        result = extract_json(content(out))
-        if not isinstance(result, list):
-            raise RuntimeError("标错模型返回的不是 JSON 数组")
-        suspects.extend(result)
-    return validate_suspects(suspects, sents)
+def validate_corrections(payload, sents, allow_semantic_auto=False):
+    """只接受模型返回的连续最小替换，不把整句润色写回字幕。"""
+    items = payload.get("items") if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        raise RuntimeError("视觉纠错模型没有返回 items 数组")
+    by_sid = {}
+    for item in items:
+        if not isinstance(item, dict) or type(item.get("sid")) is not int:
+            continue
+        by_sid.setdefault(item["sid"], item)
+    results = []
+    for sid, sentence in enumerate(sents):
+        item = by_sid.get(sid) or {}
+        changes = item.get("changes")
+        if not isinstance(changes, list):
+            continue
+        seen = set()
+        for raw_change in changes:
+            change = _valid_change(
+                raw_change,
+                str(sentence.get("text") or ""),
+                allow_semantic_auto=allow_semantic_auto,
+            )
+            if not change or change["wrong"] in seen:
+                continue
+            seen.add(change["wrong"])
+            results.append({"sid": sid, **change})
+    return results
 
 
-# ---------------- 3. VL 看帧纠正 ----------------
-VL_PROMPT = """这是一段录屏视频的一帧画面。该处字幕(语音识别)写的是:
-"{sent}"
-其中 "{wrong}" 疑似被听错。请看画面上显示的文字(代码/界面/文件名/标题/按钮等),判断 "{wrong}" 真实应该写成什么。
-
-铁律(违反任何一条都要把 found 设为 false):
-1. 只能依据画面上能**逐字读到的文字**。如果你是靠图标、logo、配色、氛围或常识"推断"出来的(画面上并没有把这个词写出来),必须 found=false,绝不许猜。
-2. correct 必须是 "{wrong}" 的**最小替换**:只替换听错的那几个字,长度/范围对齐,不要把相邻的路径段、文件夹名、按钮名也带进来。例:画面路径是 'claude skill',但 "class q" 对应的只是产品名,correct 应为 "Claude" 而不是 "claude skill"。
-3. 大小写:知名产品/专有名词用其规范写法(Claude、Codex、GitHub、Node.js),即使画面某处是小写的文件夹名也用规范大小写。
-4. 不补全、不扩写:不要因为画面上有带后缀的变体(如 ooxml.md)就给原文 ooxml 加后缀。
-5. 若画面证据表明原文其实没错,让 correct 完全等于原文。
-6. 发音一致: correct 必须是 "{wrong}" 的"读音还原"——即原文是这个词被听错的结果,两者读音必须对得上(cloud↔Claude、at↔@、class q↔Claude 都是同音/近音)。如果你在画面找到的词与 "{wrong}" 的读音明显对不上(例如 "超级麦吉" 配 "Supermario"——mài-jí 和 ma-rio 读音不符),那它就不是同一个词,必须 found=false。
-
-只返回 JSON: {{"found": true 或 false, "correct": "最终写法", "evidence": "在画面哪里逐字读到的"}}
-任何不确定一律 found=false(保留原文好过改错)。"""
-
-
-def word_time_ms(sent, wrong):
-    for w in sent.get("words", []):
-        if w.get("text") and (w["text"] in wrong or wrong in w["text"]):
-            return (w["begin_time"] + w["end_time"]) // 2
-    return (sent["begin_time"] + sent["end_time"]) // 2
+def correct_video(video, sents, allow_semantic_auto=False):
+    lines = "\n".join(
+        json.dumps({
+            "sid": sid,
+            "start_ms": sentence.get("begin_time"),
+            "end_ms": sentence.get("end_time"),
+            "text": sentence.get("text", ""),
+        }, ensure_ascii=False)
+        for sid, sentence in enumerate(sents)
+    )
+    output = bl([
+        "vision", "describe", "--model", CORRECTION_MODEL,
+        "--video", video, "--prompt", CORRECTION_USER.format(lines=lines),
+        "--output", "json", "--quiet",
+    ])
+    return validate_corrections(
+        extract_json(content(output)),
+        sents,
+        allow_semantic_auto=allow_semantic_auto,
+    )
 
 
-def grab_frame(video, ms, path):
-    subprocess.run([FFMPEG, "-y", "-ss", f"{ms/1000:.2f}", "-i", video,
-                    "-frames:v", "1", "-q:v", "2", path], capture_output=True)
-    return path
-
-
-def correct(video, sents, suspects, frames_dir, allow_semantic_auto=False):
-    # 各 suspect 相互独立 → 并发看帧纠正(每个内部 3 帧仍按命中即停顺序试)
-    def one(idx_s):
-        idx, s = idx_s
-        sent = sents[s["sid"]]
-        if s["kind"] != "screen":
-            if not allow_semantic_auto:
-                return {**s, "final": s["wrong"], "via": "semantic-pending",
-                        "needs_review": True, "guess_only": s.get("guess", "")}
-            return {**s, "final": s.get("guess", s["wrong"]), "via": "semantic"}
-        decided = None
-        for j, ms in enumerate([word_time_ms(sent, s["wrong"]),
-                                sent["begin_time"], sent["end_time"]]):
-            img = grab_frame(video, ms, os.path.join(frames_dir, f"s{idx}_{j}.jpg"))
-            try:
-                vj = extract_json(content(bl(["vision", "describe", "--model", VL_MODEL, "--image", img,
-                    "--prompt", VL_PROMPT.format(sent=sent["text"], wrong=s["wrong"]),
-                    "--output", "json", "--quiet"])))
-            except Exception as e:
-                sys.stderr.write(f"  VL parse fail s{idx}: {e}\n"); continue
-            correct_text = vj.get("correct") if isinstance(vj, dict) else None
-            evidence = vj.get("evidence") if isinstance(vj, dict) else None
-            if (vj.get("found") is True and isinstance(correct_text, str)
-                    and correct_text.strip() and "\n" not in correct_text
-                    and isinstance(evidence, str) and evidence.strip()):
-                decided = {**s, "final": vj["correct"], "via": f"vl@{ms/1000:.1f}s",
-                           "evidence": evidence,
-                           "frame": os.path.basename(img)}
-                break
-        if not decided:
-            # 零误改原则: screen 类取不到画面证据,保留原文 + 标记待确认,
-            # 绝不套用 qwen-max 的盲猜(那正是 超级麦吉→超级码力 这类误改的来源)。
-            decided = {**s, "final": s["wrong"], "via": "kept-no-evidence",
-                       "needs_review": True, "guess_only": s.get("guess", "")}
-        return decided
-    return pmap(one, list(enumerate(suspects)))
-
-
-# ---------------- 4a. 断句:用词级时间戳按标点拆长句 ----------------
-MAX_CHARS = 24       # 单条字幕最大字数
-MIN_BREAK_CHARS = 12 # 到标点且已够这么长就断
-MAX_DUR_MS = 6000    # 单条最大时长
-TAIL_MERGE = 6       # 过短尾巴并入上一条
+# ---------------- 3. 断句:用词级时间戳按标点拆长句 ----------------
+MAX_CHARS = 24
+MIN_BREAK_CHARS = 12
+MAX_DUR_MS = 6000
+TAIL_MERGE = 6
 BREAK_PUNCT = set("，。、；？！,.;?!")
+
 
 def split_words(sent):
     words = sent.get("words") or []
     if not words:
         return [{"begin_time": sent["begin_time"], "end_time": sent["end_time"], "text": sent["text"]}]
-    pieces, cur = [], []
+    pieces, current = [], []
+
     def flush():
-        if not cur:
+        if not current:
             return
-        text = "".join(w["text"] + (w.get("punctuation") or "") for w in cur).strip()
-        pieces.append({"begin_time": cur[0]["begin_time"], "end_time": cur[-1]["end_time"], "text": text})
-    for w in words:
-        cur.append(w)
-        chars = sum(len(x["text"]) for x in cur)
-        dur = w["end_time"] - cur[0]["begin_time"]
-        punc = (w.get("punctuation") or "")
-        brk = bool(punc) and punc[-1] in BREAK_PUNCT
-        if (brk and chars >= MIN_BREAK_CHARS) or chars >= MAX_CHARS or dur >= MAX_DUR_MS:
-            flush(); cur = []
+        text = "".join(word["text"] + (word.get("punctuation") or "") for word in current).strip()
+        pieces.append({"begin_time": current[0]["begin_time"], "end_time": current[-1]["end_time"], "text": text})
+
+    for word in words:
+        current.append(word)
+        chars = sum(len(item["text"]) for item in current)
+        duration = word["end_time"] - current[0]["begin_time"]
+        punctuation = word.get("punctuation") or ""
+        at_break = bool(punctuation) and punctuation[-1] in BREAK_PUNCT
+        if (at_break and chars >= MIN_BREAK_CHARS) or chars >= MAX_CHARS or duration >= MAX_DUR_MS:
+            flush()
+            current = []
     flush()
+
     merged = []
-    for p in pieces:
-        bare = p["text"].strip("，。、；？！,.;?! ")
+    for piece in pieces:
+        bare = piece["text"].strip("，。、；？！,.;?! ")
         if merged and len(bare) < TAIL_MERGE:
-            merged[-1]["text"] += p["text"]
-            merged[-1]["end_time"] = p["end_time"]
+            merged[-1]["text"] += piece["text"]
+            merged[-1]["end_time"] = piece["end_time"]
         else:
-            merged.append(p)
+            merged.append(piece)
     return merged
 
 
-# ---------------- 4b. 去水词(qwen 顺滑,失败回退规则法) ----------------
+# ---------------- 4. 去水词 ----------------
 FILLER_SYS = "你是中文视频字幕的顺滑校对,只删水词,不改实义内容。"
-FILLER_USER = """下面是按行编号的字幕。请去掉每行里的"水词",让字幕更干净易读。
+FILLER_USER = """下面是按行编号的字幕。请去掉每行里的“水词”，让字幕更干净易读。
 
-只删除:语气填充词(呃、啊、嗯、诶、唉、哦、噢)、明显的口吃重复(你你→你、就就→就、这个这个→这个、这里这里→这里)、纯语气的"那个/就是说"填充。
+只删除:语气填充词(呃、啊、嗯、诶、唉、哦、噢)、明显的口吃重复(你你→你、就就→就、这个这个→这个、这里这里→这里)、纯语气的“那个/就是说”填充。
 
 绝对不要:改动任何技术术语/产品名/数字/英文/代码;增删或改写实义内容;改变原意;合并或拆分行。某行本来就干净则原样返回。
 
-严格按原编号、原条数返回 JSON 数组,每个元素是该行清理后的纯文本字符串(顺序与条数必须和输入完全一致)。只输出 JSON 数组。
+严格按原编号、原条数返回 JSON 数组,每个元素是该行清理后的纯文本字符串(顺序与条数完全一致)。只输出 JSON 数组。
 
 字幕:
 {lines}"""
-
-import re as _re2
 _FILLERS = ["呃", "啊", "嗯", "诶", "唉", "噢", "哦"]
 
 
@@ -379,12 +366,13 @@ def safe_filler_edit(before, after):
     return True
 
 
-def _rule_clean(t):
-    for f in _FILLERS:
-        t = t.replace("，" + f + "，", "，").replace(f + "，", "").replace("，" + f, "")
-        t = t.replace(f, "")
-    t = _re2.sub(r"([一-龥])\1{1,}", r"\1", t)  # 叠字口吃: 你你→你
-    return _re2.sub(r"\s{2,}", " ", t).strip("， ").strip()
+def _rule_clean(text):
+    for filler in _FILLERS:
+        text = text.replace("，" + filler + "，", "，").replace(filler + "，", "").replace("，" + filler, "")
+        text = text.replace(filler, "")
+    text = re.sub(r"([一-龥])\1{1,}", r"\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip("， ").strip()
+
 
 def clean_fillers(segs):
     cleaned = {}
@@ -392,10 +380,13 @@ def clean_fillers(segs):
     for chunk in batches(indexed, lambda item: f"{item[1]['text']}\n"):
         lines = "\n".join(f"{index}: {segment['text']}" for index, segment in chunk)
         try:
-            out = bl(["text", "chat", "--model", FILLER_MODEL, "--system", FILLER_SYS,
-                      "--message", FILLER_USER.format(lines=lines),
-                      "--max-tokens", "5000", "--output", "json"])
-            data = extract_json(content(out))
+            output = bl([
+                "text", "chat", "--model", FILLER_MODEL,
+                "--system", FILLER_SYS,
+                "--message", FILLER_USER.format(lines=lines),
+                "--max-tokens", "5000", "--output", "json",
+            ])
+            data = extract_json(content(output))
             if isinstance(data, list) and len(data) == len(chunk):
                 for (index, segment), candidate in zip(chunk, data):
                     candidate = candidate if isinstance(candidate, str) else (
@@ -403,138 +394,139 @@ def clean_fillers(segs):
                     )
                     if candidate is not None and safe_filler_edit(segment["text"], candidate):
                         cleaned[index] = candidate
-        except Exception as e:
-            sys.stderr.write(f"  去水词(qwen)失败,回退规则法: {e}\n")
-    res = []
-    for i, s in enumerate(segs):
-        t = (cleaned[i] if i in cleaned else _rule_clean(s["text"])).strip()
-        if t:
-            s = dict(s); s["text"] = t; res.append(s)
-    return res
+        except Exception as exc:
+            sys.stderr.write(f"  去水词(qwen)失败,回退规则法: {exc}\n")
+    result = []
+    for index, segment in enumerate(segs):
+        text = (cleaned[index] if index in cleaned else _rule_clean(segment["text"])).strip()
+        if text:
+            segment = dict(segment)
+            segment["text"] = text
+            result.append(segment)
+    return result
 
 
-# ---------------- 4c. 应用纠正 + 断句 + 顺滑 + 产出 ----------------
+# ---------------- 5. 应用纠正 + 断句 + 产出 ----------------
 def build_outputs(sents, results, out_dir):
-    corrected = [dict(s) for s in sents]
+    corrected = [dict(sentence) for sentence in sents]
     changes = []
-    for r in results:
-        sid, wrong, final = r["sid"], r["wrong"], r["final"]
+    for result in results:
+        sid, wrong, final = result["sid"], result["wrong"], result["final"]
         if final and final != wrong and wrong in corrected[sid]["text"]:
             corrected[sid]["text"] = corrected[sid]["text"].replace(wrong, final, 1)
-            changes.append(r)
+            changes.append(result)
 
-    # 断句:从原始 words 拆,再把该句的纠正套回每个片段
     segments = []
-    for sid, sent in enumerate(sents):
-        repls = [(c["wrong"], c["final"]) for c in changes if c["sid"] == sid]
-        for p in split_words(sent):
-            for wrong, final in repls:
-                if wrong in p["text"]:
-                    p["text"] = p["text"].replace(wrong, final, 1)
-            segments.append(p)
+    for sid, sentence in enumerate(sents):
+        replacements = [(item["wrong"], item["final"]) for item in changes if item["sid"] == sid]
+        for piece in split_words(sentence):
+            for wrong, final in replacements:
+                if wrong in piece["text"]:
+                    piece["text"] = piece["text"].replace(wrong, final, 1)
+            segments.append(piece)
 
-    # 去水词
     segments = clean_fillers(segments)
-
-    # SRT(最终交付:已纠错 + 已断句 + 已去水词)
     srt = []
-    for i, s in enumerate(segments, 1):
-        srt.append(f"{i}\n{ms_to_srt(s['begin_time'])} --> {ms_to_srt(s['end_time'])}\n{s['text']}\n")
+    for index, segment in enumerate(segments, 1):
+        srt.append(
+            f"{index}\n{ms_to_srt(segment['begin_time'])} --> "
+            f"{ms_to_srt(segment['end_time'])}\n{segment['text']}\n"
+        )
     write_text(Path(out_dir, "corrected.srt"), "\n".join(srt))
 
-    # 预览页格式(start/end 秒 + text)
-    preview = [{"start": round(s["begin_time"] / 1000, 3),
-                "end": round(s["end_time"] / 1000, 3),
-                "text": s["text"]} for s in segments]
+    preview = [
+        {"start": round(segment["begin_time"] / 1000, 3),
+         "end": round(segment["end_time"] / 1000, 3),
+         "text": segment["text"]}
+        for segment in segments
+    ]
     write_json(Path(out_dir, "transcript.json"), preview)
     write_json(Path(out_dir, "corrected.json"), corrected)
     write_json(Path(out_dir, "report.json"), results)
 
-    review = [r for r in results if r.get("needs_review")]
-
-    # 可读报告
-    rep = ["# 字幕纠错报告\n",
-           f"共标记 {len(results)} 处可疑,有画面证据并修改 {len(changes)} 处,"
-           f"取不到证据保留原文待人工确认 {len(review)} 处。\n",
-           "## 已修改(均有画面铁证)"]
-    for r in changes:
-        ev = f"\n    画面证据: {r['evidence']}" if r.get("evidence") else ""
-        rep.append(f"- 句{r['sid']} [{r['kind']}/{r['via']}] 「{r['wrong']}」→「{r['final']}」{ev}")
+    review = [result for result in results if result.get("needs_review")]
+    report = [
+        "# 字幕纠错报告\n",
+        f"共标记 {len(results)} 处可疑,有画面证据并修改 {len(changes)} 处,"
+        f"取不到证据保留原文待人工确认 {len(review)} 处。\n",
+        "## 已修改(均有画面铁证)",
+    ]
+    for result in changes:
+        evidence = f"\n    画面证据: {result['evidence']}" if result.get("evidence") else ""
+        report.append(
+            f"- 句{result['sid']} [{result['kind']}/{result['via']}] "
+            f"「{result['wrong']}」→「{result['final']}」{evidence}"
+        )
     if review:
-        rep.append("\n## 待人工确认(画面未能逐字取证,已保留原文)")
-        for r in review:
-            g = f",模型猜测可能是「{r['guess_only']}」" if r.get("guess_only") else ""
-            rep.append(f"- 句{r['sid']} 「{r['wrong']}」 可疑{g}(原因: {r.get('reason','')})")
-    write_text(Path(out_dir, "report.md"), "\n".join(rep))
+        report.append("\n## 待人工确认(没有自动采用的语义候选)")
+        for result in review:
+            guess = f",模型猜测可能是「{result['guess_only']}」" if result.get("guess_only") else ""
+            report.append(
+                f"- 句{result['sid']} 「{result['wrong']}」 可疑{guess}"
+                f"(原因: {result.get('reason', '')})"
+            )
+    write_text(Path(out_dir, "report.md"), "\n".join(report))
     return segments, changes, review
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("video")
-    ap.add_argument("--out", default=None)
-    ap.add_argument("--max-seconds", type=int, default=0)
-    ap.add_argument("--lang", default="zh")
-    ap.add_argument("--allow-semantic-auto", action="store_true",
-                    help="允许自动采用纯语义纠错猜测；默认保留待人工确认")
-    ap.add_argument("--reuse", action="store_true",
-                    help="复用 out 目录已有的 asr.json / suspects.json,只重跑 VL")
-    args = ap.parse_args()
-
-    # 认证由 bl CLI 自管；缺少官方登录时，下面第一个 bl 调用会自然报错。
+    parser = argparse.ArgumentParser()
+    parser.add_argument("video")
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--max-seconds", type=int, default=0)
+    parser.add_argument("--lang", default="zh")
+    parser.add_argument(
+        "--allow-semantic-auto", action="store_true",
+        help="允许自动采用纯语义纠错猜测；默认保留待人工确认",
+    )
+    parser.add_argument(
+        "--reuse", action="store_true",
+        help="复用 out 目录已有的 asr.json，只重跑整段视频纠错",
+    )
+    args = parser.parse_args()
 
     if args.max_seconds < 0:
-        ap.error("--max-seconds 不能为负数")
+        parser.error("--max-seconds 不能为负数")
     try:
         signature = source_signature(args.video, args.max_seconds, args.lang)
         out_dir = Path(args.out or (os.path.splitext(args.video)[0] + ".subfix")).expanduser()
         prepare_run_meta(out_dir, signature, args.reuse)
     except (FileNotFoundError, RuntimeError) as exc:
-        ap.error(str(exc))
-    frames_dir = out_dir / "frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
-    asr_path = out_dir / "asr.json"
-    sus_path = out_dir / "suspects.json"
+        parser.error(str(exc))
 
-    if args.reuse and os.path.exists(asr_path):
-        print(f"[1/4] 复用 asr.json")
+    asr_path = out_dir / "asr.json"
+    correction_path = out_dir / "correction.json"
+    if args.reuse and asr_path.exists():
+        print("[1/3] 复用 asr.json")
         sents = json.loads(asr_path.read_text(encoding="utf-8"))["transcripts"][0]["sentences"]
     else:
-        print(f"[1/4] FunAudio ASR …")
+        print("[1/3] FunAudio ASR …")
         sents = run_asr(args.video, out_dir, args.max_seconds, args.lang)
     print(f"      {len(sents)} 句")
 
-    if args.reuse and os.path.exists(sus_path):
-        print(f"[2/4] 复用 suspects.json")
-        suspects = validate_suspects(
-            json.loads(sus_path.read_text(encoding="utf-8")), sents
-        )
-    else:
-        print(f"[2/4] qwen3.7-max 标错(高精度)…")
-        suspects = flag_suspects(sents)
-        write_json(sus_path, suspects)
-    print(f"      标出 {len(suspects)} 处可疑")
-    for s in suspects:
-        print(f"        [{s['kind']:8s}] 句{s['sid']}: 「{s['wrong']}」→ 猜「{s.get('guess','')}」")
+    print(f"[2/3] {CORRECTION_MODEL} 读取整段视频并纠正 …")
+    results = correct_video(args.video, sents, args.allow_semantic_auto)
+    write_json(correction_path, results)
+    print(f"      返回 {len(results)} 处模型候选")
 
-    print(f"[3/4] qwen-vl 看帧纠正 …")
-    results = correct(args.video, sents, suspects, frames_dir, args.allow_semantic_auto)
-
-    print(f"[4/4] 断句顺滑(拆长句+去水词) + 产出 SRT/报告 …")
+    print("[3/3] 断句顺滑(拆长句+去水词) + 产出 SRT/报告 …")
     segments, changes, review = build_outputs(sents, results, out_dir)
 
     print(f"\n========== 已修改 {len(changes)} 处(均有画面证据) ==========")
-    for r in changes:
-        ev = f"  | {r.get('evidence','')[:46]}" if r.get("evidence") else ""
-        print(f"句{r['sid']:>2} [{r['via']:16s}] 「{r['wrong']}」→「{r['final']}」{ev}")
+    for result in changes:
+        evidence = f"  | {result.get('evidence', '')[:46]}" if result.get("evidence") else ""
+        print(
+            f"句{result['sid']:>2} [{result['via']:22s}] "
+            f"「{result['wrong']}」→「{result['final']}」{evidence}"
+        )
     if review:
-        print(f"\n---------- 保留原文待确认 {len(review)} 处(画面取不到证据) ----------")
-        for r in review:
-            g = f" 猜「{r['guess_only']}」" if r.get("guess_only") else ""
-            print(f"句{r['sid']:>2} 「{r['wrong']}」{g}")
+        print(f"\n---------- 保留原文待确认 {len(review)} 处(没有自动采用) ----------")
+        for result in review:
+            guess = f" 猜「{result['guess_only']}」" if result.get("guess_only") else ""
+            print(f"句{result['sid']:>2} 「{result['wrong']}」{guess}")
     print(f"\n{len(sents)} 句 → 断句顺滑后 {len(segments)} 条字幕")
     print(f"输出目录: {out_dir}")
-    print(f"  corrected.srt / transcript.json / corrected.json / report.md / report.json")
+    print("  corrected.srt / transcript.json / corrected.json / report.md / report.json")
 
 
 if __name__ == "__main__":

@@ -4,14 +4,14 @@
 
 ## 它解决什么
 
-录屏 / 教程 / 讲解类视频的字幕,无论哪家 ASR,**专有名词永远会被听错**(`Claude`→`cloud`、`Codex`→`class q`、`html2pptx`→`html to ppt`)。核心做法:**让视觉模型按时间戳去看那一帧,读屏幕上真实写着的字来纠正**——这是纯语音工具做不到的。
+录屏 / 教程 / 讲解类视频的字幕,无论哪家 ASR,**专有名词永远会被听错**(`Claude`→`cloud`、`Codex`→`class q`、`html2pptx`→`html to ppt`)。核心做法:**让一个支持视频输入的视觉模型结合 ASR 时间范围读取真实画面,直接返回最小替换**——这是纯语音工具做不到的。
 
 ## 流程(5 步,全程 `bl`)
 
 | 步骤 | 能力 | 模型 | bl 命令 |
 |---|---|---|---|
 | 1 听写 | 语音识别 | fun-asr | `bl speech recognize` |
-| 2 看屏纠错 ★ | 标错 + 看帧 | qwen3.7-max + qwen3-vl-plus | `bl text chat` / `bl vision describe` |
+| 2 看屏纠错 ★ | 一步完成标错、取证和最小替换 | qwen3.8-max(默认) | `bl vision describe` |
 | 3 顺滑 | 断句(算法) + 去水词 | qwen-plus | `bl text chat` |
 | 4 翻译 | 字幕 / 配音稿 | qwen-mt-turbo / qwen-plus | `bl text chat` |
 | 5 克隆配音 | 声音克隆 + 合成 | cosyvoice-v2 | `bl file upload` / `bl speech synthesize` |
@@ -37,7 +37,9 @@ python3 scripts/dub_multi.py <video.mp4> --transcript <上一步>/transcript.jso
 python3 scripts/preview_editor.py <out>/manifest.json
 ```
 
-默认只自动采用有画面文字证据的纠错；纯语义猜测会留在报告中等待确认。已有输出目录不要换视频复用；需要恢复时使用同一来源视频和 `--reuse`。
+默认只自动采用有画面文字证据的纠错；纯语义猜测会留在报告中等待确认。已有输出目录不要换视频复用；需要恢复时使用同一来源视频和 `--reuse`，它只复用 ASR，视觉纠错会重新读取视频。
+
+视觉纠错默认使用 `qwen3.8-max`。实测同一条 89 秒录屏时，qwen3.8-flash 的候选召回在多次运行中波动较大；如需成本优先试跑，可显式设置 `SUBFIX_CORRECTION_MODEL=qwen3.8-flash`，但建议人工核对 `report.md`。
 
 ## 设计原则:零误改优先
 

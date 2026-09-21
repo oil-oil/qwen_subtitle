@@ -22,22 +22,20 @@ description: "结合语音与真实画面纠正视频字幕，按需翻译字幕
 | 能力 | 模型 | 走的命令 | 角色 |
 |---|---|---|---|
 | 🎙️ 语音识别 | FunAudio-ASR | `bl speech recognize` | 出字幕,带**句级+词级毫秒时间戳**——后续抽帧、断句、对齐配音都靠它 |
-| 🧠 标错 | qwen3.7-max | `bl text chat` | 高精度扫出"明显听错"的点,分 screen / semantic 两类 |
-| 👁️ 看屏纠正 | qwen3-vl-plus | `bl vision describe` | 对 screen 类按时间戳抽帧、读屏上真实文字定夺,带画面证据 |
+| 🧠👁️ 视觉纠错 | qwen3.8-max(默认) / qwen3.8-flash(可选) | `bl vision describe` | 一次读取整段视频和带时间范围的 ASR,只返回最小术语替换与画面证据 |
 | ✨ 去水词 | qwen-plus | `bl text chat` | 删呃啊嗯、口吃重复,顺滑 |
 
-模型分工是**实测**定下来的:标错用 qwen3.7-max(精度命门,plus 会漏真错、且重新误标);去水词用 qwen-plus(低风险,快 5 倍)。这些在脚本顶部 `FLAG_MODEL / VL_MODEL / FILLER_MODEL` 常量里,需要时直接改。
+模型分工是**实测**定下来的:纠错改为一个视觉模型完成，不再串联“标错模型 + 看屏模型”；默认用 qwen3.8-max，因为在同一条 89 秒录屏上的 Flash 召回波动较大。需要成本优先试跑时，可用 `SUBFIX_CORRECTION_MODEL=qwen3.8-flash` 切换；去水词继续用 qwen-plus(低风险、提示词短、无需视觉)。脚本顶部的 `CORRECTION_MODEL / FILLER_MODEL` 是唯一模型配置入口。
 
 ## 流程(5 步,一条命令跑完)
 
 ```
 视频
- ├─[1] FunAudio ASR ───────► 字幕轨道(句+词级毫秒时间戳)
- ├─[2] qwen3.7-max 标错 ───► 可疑点(screen=看画面 / semantic=纯语义)
- ├─[3] qwen3-vl-plus 看帧 ─► screen 类逐帧读屏纠正(带证据)
- │                           └ 取不到证据 → 保留原文+标记待确认〔零误改〕
- ├─[4] 词级时间戳断句 ─────► 按标点拆长句(>24字 / >6秒)
- ├─[5] qwen-plus 去水词 ───► 删语气词/口吃,顺滑
+ ├─[1] FunAudio ASR ─────────► 字幕轨道(句+词级毫秒时间戳)
+ ├─[2] qwen3.8-max 视觉纠错 ──► 整段视频 + ASR 时间范围 → 最小替换 + 证据
+ │                              └ 取不到证据/纯语义 → 保留原文待确认〔零误改〕
+ ├─[3] 词级时间戳断句 ─────────► 按标点拆长句(>24字 / >6秒)
+ ├─[4] qwen-plus 去水词 ───────► 删语气词/口吃,顺滑
  └─► corrected.srt + transcript.json + report.md(画面证据)
 ```
 
@@ -67,9 +65,9 @@ description: "结合语音与真实画面纠正视频字幕，按需翻译字幕
 python3 scripts/subfix.py <video.mp4> [--out DIR]
 ```
 
-参数:`--out DIR`(默认 `<视频名>.subfix/`)、`--max-seconds N`(试跑前 N 秒)、`--lang zh`、`--reuse`(仅在来源视频、语言和试跑范围指纹一致时复用)、`--allow-semantic-auto`(明确授权后才自动采用纯语义猜测)。已有产物时不要换视频复用目录。
+参数:`--out DIR`(默认 `<视频名>.subfix/`)、`--max-seconds N`(ASR 试跑前 N 秒,视觉模型仍接收原视频但只按列出的时间范围取证)、`--lang zh`、`--reuse`(仅在来源视频、语言和试跑范围指纹一致时复用 ASR;每次都会重新读取视频做纠错)、`--allow-semantic-auto`(明确授权后才自动采用纯语义猜测)。已有产物时不要换视频复用目录。
 
-产出:`corrected.srt`(纠错+断句+去水词的中文字幕)、`transcript.json`(`[{start,end,text}]`)、`report.md`(每处改动 + **画面证据** + "取不到证据保留原文待确认"清单);另有 `corrected.json`(句级结构化结果)与 `report.json`(机器可读证据)。中间产物:`asr.json`/`suspects.json`。
+产出:`corrected.srt`(纠错+断句+去水词的中文字幕)、`transcript.json`(`[{start,end,text}]`)、`report.md`(每处改动 + **画面证据** + "取不到证据保留原文待确认"清单);另有 `corrected.json`(句级结构化结果)、`correction.json`(视觉模型通过程序校验后的最小替换)与 `report.json`(机器可读证据)。中间产物:`asr.json`。
 
 > 给用户看结果时:念 `report.md` 的改动+证据(最有说服力);诚实区分"已改(有画面铁证)"与"保留原文待确认",别把后者说成已修复。纯语义纠错默认也只进入待确认清单；只有用户明确允许时才传 `--allow-semantic-auto`。
 
@@ -113,16 +111,17 @@ python3 scripts/preview_editor.py <video> <transcript.json>  # 单语言
 
 字幕工具里,**错误的"纠正"比不纠正更糟**——把对的词改成错的会主动污染字幕。所以这套流程的每一步都在"宁可不改,不可改错":
 
-- **标错别越界**:只标明显听错的;本身通顺、像名字的中文(哪怕疑似音译)和本身正确只是"不够具体"的词,都不标。
-- **VL 禁幻觉**:只认画面上能逐字读到的文字;靠图标/logo/常识推断的一律不算数。
+- **模型别越界**:只返回明显听错的术语;本身通顺、像名字的中文(哪怕疑似音译)和本身正确只是"不够具体"的词,都不标。
+- **视觉禁幻觉**:只认对应时间范围内能逐字读到的文字;靠图标/logo/常识推断的一律不算数。
 - **最小替换 + 发音一致**:只替换听错的那几个字,不带进相邻路径段;改后的词必须和原文读音对得上。
 - **证不了就留原文**:screen 类取不到画面证据,保留原文 + 标记待确认,绝不套用模型盲猜。
+- **程序复核兜底**:只接受出现在原句中的连续 `wrong`,拒绝整句润色、标点/空格/语法调整;screen 还必须带画面证据,semantic 默认只进待确认。
 
-这些闸门是踩了一轮坑(误标 ooxml、把"超级麦吉"改成"超级码力/Supermario")才加上的。每条闸门的来龙去脉、对应的提示词写法,见 **[references/design-gates.md](references/design-gates.md)**——改提示词前务必先读,否则容易把精度调回原形。
+这些闸门是踩了一轮坑(误标 ooxml、把"超级麦吉"改成"超级码力/Supermario")才加上的。每条闸门的来龙去脉、对应的提示词和程序复核规则,见 **[references/design-gates.md](references/design-gates.md)**——改提示词前务必先读,否则容易把精度调回原形。
 
 ## 调参(脚本顶部常量)
 
-- `FLAG_MODEL / VL_MODEL / FILLER_MODEL` —— 三阶段模型
+- `SUBFIX_CORRECTION_MODEL` / `CORRECTION_MODEL / FILLER_MODEL` —— 视觉纠错与去水词模型；默认纠错模型为 qwen3.8-max
 - `MAX_CHARS=24` / `MAX_DUR_MS=6000` —— 断句阈值(单条字幕最大字数/时长)
 - `MIN_BREAK_CHARS=12` —— 到标点且已够这么长就断
-- 甜区:录屏 / 屏幕共享 / 教程类(术语都写在屏上)。纯口播、谈话头(术语不在画面)时,VL 取不到证据会更多保留原文——这是预期行为,不是 bug。
+- 甜区:录屏 / 屏幕共享 / 教程类(术语都写在屏上)。纯口播、谈话头(术语不在画面)时,视觉模型取不到证据会更多保留原文——这是预期行为,不是 bug。
